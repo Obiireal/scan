@@ -1,103 +1,118 @@
-import threading
+import mnemonic
+import bip32utils
 import requests
-from mnemonic import Mnemonic
-import hashlib
-from ecdsa import SigningKey, SECP256k1
+import logging
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import Progress
 
-# Tải danh sách từ của BIP-39
-mnemo = Mnemonic("english")
+console = Console()
+logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[RichHandler()])
+logger = logging.getLogger("rich")
 
-# Tạo seed phrase
-def generate_seed_phrase():
-    return mnemo.generate(strength=128)  # 12 từ
+def clear_console():
+    """Clear the console screen."""
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        os.system('clear')
 
-# Chuyển seed phrase thành seed
-def seed_phrase_to_seed(seed_phrase, passphrase=""):
-    return mnemo.to_seed(seed_phrase, passphrase)
+def generate_mnemonic():
+    mnemo = mnemonic.Mnemonic("english")
+    return mnemo.generate(strength=128)
 
-# Chuyển seed thành private key
-def seed_to_private_key(seed):
-    return seed[:32]  # Lấy 32 byte đầu tiên từ seed
+def recover_wallet_from_mnemonic(mnemonic_phrase):
+    seed = mnemonic.Mnemonic.to_seed(mnemonic_phrase)
+    root_key = bip32utils.BIP32Key.fromEntropy(seed)
+    child_key = root_key.ChildKey(44 | bip32utils.BIP32_HARDEN).ChildKey(0 | bip32utils.BIP32_HARDEN).ChildKey(0 | bip32utils.BIP32_HARDEN).ChildKey(0).ChildKey(0)
+    address = child_key.Address()
+    balance = check_BTC_balance(address)
+    return mnemonic_phrase, balance, address
 
-# Tạo địa chỉ Bitcoin từ private key
-def private_key_to_bitcoin_address(private_key):
-    sk = SigningKey.from_string(private_key, curve=SECP256k1)
-    vk = sk.verifying_key
-    public_key = b"\x04" + vk.to_string()
+def recover_wallet_from_partial_mnemonic(partial_mnemonic):
+    partial_mnemonic_words = partial_mnemonic.split()
+    
+    if len(partial_mnemonic_words) != 11:
+        logger.error("You must provide exactly 11 words.")
+        return None, 0, None
 
-    # SHA256 -> RIPEMD-160
-    sha256 = hashlib.sha256(public_key).digest()
-    ripemd160 = hashlib.new("ripemd160")
-    ripemd160.update(sha256)
-    public_key_hash = ripemd160.digest()
+    logger.info(f"Attempting to recover wallet from {len(partial_mnemonic_words)} words. Trying all possible 12th words.")
 
-    # Thêm version byte (0x00 cho Bitcoin Mainnet)
-    versioned_payload = b"\x00" + public_key_hash
+    wordlist = mnemonic.Mnemonic("english").wordlist
+    
+    with Progress() as progress:
+        task = progress.add_task("[cyan]Brute-forcing 12th word...", total=2048)
 
-    # Thêm checksum (SHA256 x2)
-    checksum = hashlib.sha256(hashlib.sha256(versioned_payload).digest()).digest()[:4]
-    address = versioned_payload + checksum
+        for word in wordlist:
+            full_mnemonic = ' '.join(partial_mnemonic_words + [word])
+            mnemonic_phrase, balance, address = recover_wallet_from_mnemonic(full_mnemonic)
+            progress.update(task, advance=1)
+            
+            logger.info(f"Trying mnemonic phrase: {full_mnemonic}")
+            logger.info(f"Wallet Address: {address}, Balance: {balance} BTC")
+            
+            if balance > 0:
+                logger.info(f"Found wallet with non-zero balance: {balance} BTC")
+                logger.info(f"Mnemonic Phrase: {mnemonic_phrase}")
+                with open("wallet.txt", "a") as f:
+                    f.write(f"Mnemonic Phrase: {mnemonic_phrase}\n")
+                    f.write(f"Wallet Address: {address}\n")
+                    f.write(f"Balance: {balance} BTC\n\n")
+                return mnemonic_phrase, balance, address
 
-    # Encode Base58
-    return base58_encode(address)
+    logger.info("No wallet found with the provided partial mnemonic phrase.")
+    return None, 0, None
 
-# Base58 encoding
-def base58_encode(data):
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    value = int.from_bytes(data, "big")
-    encoded = ""
-    while value:
-        value, mod = divmod(value, 58)
-        encoded = alphabet[mod] + encoded
-    n_pad = len(data) - len(data.lstrip(b"\x00"))
-    return "1" * n_pad + encoded
-
-# Truy vấn số dư của địa chỉ qua API
-def get_balance_from_address(address):
-    try:
-        response = requests.get(f"https://api.blockchair.com/bitcoin/dashboards/address/{address}")
-        response.raise_for_status()
-        data = response.json()
-        balance_satoshis = data["data"][address]["address"]["balance"]
-        return balance_satoshis / 1e8  # Chuyển từ satoshi sang BTC
-    except Exception as e:
-        print(f"Error fetching balance for {address}: {e}")
+def check_BTC_balance(address, retries=3, delay=0):
+    for attempt in range(retries):
+        try:
+            response = requests.get(f"https://blockchain.info/balance?active={address}", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            balance = data[address]["final_balance"]
+            return balance / 100000000
+        except requests.RequestException as e:
+            if attempt < retries - 1:
+                logger.error(f"Error checking balance, retrying in {delay} seconds: {str(e)}")
+                time.sleep(delay)
+            else:
+                logger.error("Error checking balance: %s", str(e))
     return 0
 
-# Xử lý seed phrase trong một luồng
-def process_seed_phrase(seed_phrase):
-    seed = seed_phrase_to_seed(seed_phrase)
-    private_key = seed_to_private_key(seed)
-    address = private_key_to_bitcoin_address(private_key)
+def check_wallets_parallel(mnemonic_phrases):
+    with ThreadPoolExecutor(max_workers=1000) as executor:
+        futures = [executor.submit(recover_wallet_from_mnemonic, phrase) for phrase in mnemonic_phrases]
+        
+        for future in as_completed(futures):
+            mnemonic_phrase, balance, address = future.result()
+            logger.info(f"Mnemonic Phrase: {mnemonic_phrase}")
+            logger.info(f"Wallet Address: {address}, Balance: {balance} BTC")
+            if balance > 0:
+                logger.info(f"Found wallet with non-zero balance: {balance} BTC")
+                with open("wallet.txt", "a") as f:
+                    f.write(f"Mnemonic Phrase: {mnemonic_phrase}\n")
+                    f.write(f"Wallet Address: {address}\n")
+                    f.write(f"Balance: {balance} BTC\n\n")
 
-    balance = get_balance_from_address(address)
-    if balance > 0:
-        save_to_file(seed_phrase, "Bitcoin Wallet", balance)
-        print(f"FOUND BTC! Address: {address}, Balance: {balance} BTC")
-
-# Lưu seed phrase vào file
-def save_to_file(seed_phrase, wallet_name, balance):
-    with open("found_wallets.txt", "a") as file:
-        file.write(f"{wallet_name} | {seed_phrase} | {balance} BTC\n")
-
-# Chạy song song 100 seed phrase mỗi giây
-def run_threads():
-    threads = []
-    for _ in range(100):  # Tạo 100 seed phrase song song
-        seed_phrase = generate_seed_phrase()
-        thread = threading.Thread(target=process_seed_phrase, args=(seed_phrase,))
-        threads.append(thread)
-        thread.start()
-
-    # Đợi tất cả các luồng hoàn thành
-    for thread in threads:
-        thread.join()
-
-# Chương trình chính
 if __name__ == "__main__":
-    while True:
-        start_time = time.time()
-        run_threads()  # Chạy 100 seed phrase song song
-        elapsed_time = time.time() - start_time
-        print(f"Processed 100 seed phrases in {elapsed_time:.2f} seconds")
+    console.print("[bold green]Welcome to the Bitcoin Wallet Recovery Tool![/bold green]")
+    
+    choice = input("(1) Recover wallet\n(2) Check random wallets\nType choice: ")
+
+    clear_console()
+
+    if choice == "1":
+        partial_mnemonic = input("Enter the words you remember from your mnemonic phrase, separated by spaces: ")
+        recover_wallet_from_partial_mnemonic(partial_mnemonic)
+    elif choice == "2":
+        mnemonic_count = 0
+        while True:
+            mnemonic_phrases = [generate_mnemonic() for _ in range(100)]  # Tạo 10 mnemonic ngẫu nhiên
+            check_wallets_parallel(mnemonic_phrases)
+            mnemonic_count += 100
+            logger.info(f"Total Mnemonic Phrases generated: {mnemonic_count}")
+    else:
+        logger.error("Invalid choice. Exiting...")
