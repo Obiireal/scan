@@ -9,9 +9,13 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress
 
+# Logger setup
 console = Console()
 logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[RichHandler()])
 logger = logging.getLogger("rich")
+
+# Global variables
+scanned_wallets = []  # To store wallets with non-zero balance
 
 def clear_console():
     """Clear the console screen."""
@@ -32,6 +36,22 @@ def recover_wallet_from_mnemonic(mnemonic_phrase):
     balance = check_BTC_balance(address)
     return mnemonic_phrase, balance, address
 
+def check_BTC_balance(address, retries=3, delay=0):
+    for attempt in range(retries):
+        try:
+            response = requests.get(f"https://blockchain.info/balance?active={address}", timeout=1)
+            response.raise_for_status()
+            data = response.json()
+            balance = data[address]["final_balance"]
+            return balance / 100000000
+        except requests.RequestException as e:
+            if attempt < retries - 1:
+                a = 2
+                time.sleep(delay)
+            else:
+                a = 1
+    return 0
+
 def recover_wallet_from_partial_mnemonic(partial_mnemonic):
     partial_mnemonic_words = partial_mnemonic.split()
     
@@ -40,50 +60,42 @@ def recover_wallet_from_partial_mnemonic(partial_mnemonic):
         return None, 0, None
 
     logger.info(f"Attempting to recover wallet from {len(partial_mnemonic_words)} words. Trying all possible 12th words.")
-
-    wordlist = mnemonic.Mnemonic("english").wordlist
     
-    with Progress() as progress:
-        task = progress.add_task("[cyan]Brute-forcing 12th word...", total=2048)
+    wordlist = mnemonic.Mnemonic("english").wordlist
 
-        for word in wordlist:
-            full_mnemonic = ' '.join(partial_mnemonic_words + [word])
-            mnemonic_phrase, balance, address = recover_wallet_from_mnemonic(full_mnemonic)
-            progress.update(task, advance=1)
-            
-            logger.info(f"Trying mnemonic phrase: {full_mnemonic}")
-            logger.info(f"Wallet Address: {address}, Balance: {balance} BTC")
-            
-            if balance > 0:
-                logger.info(f"Found wallet with non-zero balance: {balance} BTC")
-                logger.info(f"Mnemonic Phrase: {mnemonic_phrase}")
-                with open("wallet.txt", "a") as f:
-                    f.write(f"Mnemonic Phrase: {mnemonic_phrase}\n")
-                    f.write(f"Wallet Address: {address}\n")
-                    f.write(f"Balance: {balance} BTC\n\n")
-                return mnemonic_phrase, balance, address
+    for word in wordlist:
+        full_mnemonic = ' '.join(partial_mnemonic_words + [word])
+        mnemonic_phrase, balance, address = recover_wallet_from_mnemonic(full_mnemonic)
 
-    logger.info("No wallet found with the provided partial mnemonic phrase.")
+        logger.info(f"Trying mnemonic phrase: {full_mnemonic}")
+        logger.info(f"Wallet Address: {address}, Balance: {balance} BTC")
+        
+        if balance > 0:
+            logger.info(f"Found wallet with non-zero balance: {balance} BTC")
+            logger.info(f"Mnemonic Phrase: {mnemonic_phrase}")
+            
+            # Store wallet in the scanned_wallets list
+            scanned_wallets.append((mnemonic_phrase, address, balance))
+            
+            with open("wallet.txt", "a") as f:
+                f.write(f"Mnemonic Phrase: {mnemonic_phrase}\n")
+                f.write(f"Wallet Address: {address}\n")
+                f.write(f"Balance: {balance} BTC\n\n")
+            break
+
     return None, 0, None
 
-def check_BTC_balance(address, retries=3, delay=0):
-    for attempt in range(retries):
-        try:
-            response = requests.get(f"https://blockchain.info/balance?active={address}", timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            balance = data[address]["final_balance"]
-            return balance / 100000000
-        except requests.RequestException as e:
-            if attempt < retries - 1:
-                logger.error(f"Error checking balance, retrying in {delay} seconds: {str(e)}")
-                time.sleep(delay)
-            else:
-                logger.error("Error checking balance: %s", str(e))
-    return 0
+def display_scanned_wallets():
+    """Display the wallets with non-zero balances."""
+    console.print("\n[bold cyan]Scanned Wallets with Non-Zero Balance[/bold cyan]\n")
+    for mnemonic_phrase, address, balance in scanned_wallets:
+        console.print(f"Mnemonic: {mnemonic_phrase[:20]}...", style="bold green")
+        console.print(f"Address: {address[:20]}...", style="bold green")
+        console.print(f"Balance: {balance:.8f} BTC", style="bold green")
+        console.print("-" * 50)
 
 def check_wallets_parallel(mnemonic_phrases):
-    with ThreadPoolExecutor(max_workers=1000) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(recover_wallet_from_mnemonic, phrase) for phrase in mnemonic_phrases]
         
         for future in as_completed(futures):
@@ -97,7 +109,7 @@ def check_wallets_parallel(mnemonic_phrases):
                     f.write(f"Wallet Address: {address}\n")
                     f.write(f"Balance: {balance} BTC\n\n")
 
-if __name__ == "__main__":
+def main():
     console.print("[bold green]Welcome to the Bitcoin Wallet Recovery Tool![/bold green]")
     
     choice = input("(1) Recover wallet\n(2) Check random wallets\nType choice: ")
@@ -110,9 +122,15 @@ if __name__ == "__main__":
     elif choice == "2":
         mnemonic_count = 0
         while True:
-            mnemonic_phrases = [generate_mnemonic() for _ in range(100)]  # Tạo 10 mnemonic ngẫu nhiên
+            mnemonic_phrases = [generate_mnemonic() for _ in range(500)]  # Generate 500 random mnemonics
             check_wallets_parallel(mnemonic_phrases)
-            mnemonic_count += 100
+            mnemonic_count += 500
             logger.info(f"Total Mnemonic Phrases generated: {mnemonic_count}")
     else:
         logger.error("Invalid choice. Exiting...")
+
+    # Display scanned wallets in the console
+    display_scanned_wallets()
+
+if __name__ == "__main__":
+    main()
